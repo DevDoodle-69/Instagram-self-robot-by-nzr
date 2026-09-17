@@ -1,2 +1,0 @@
-# Copy this file to account.txt and replace it with your own Instagram cookies
-# Required cookies: sessionid and ds_user_id
