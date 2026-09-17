@@ -1,18 +1,5 @@
 "use strict";
 
-/**
- * `sing` — send the FULL song as an audio attachment.
- *
- * Unlike `music` (which attaches a 20-30s Instagram music sticker), this command
- * talks to the configured full-song API, picks the best downloadable audio URL
- * from the results and streams those bytes to the chat as a voice/audio message.
- *
- * The track list from `music.apiUrl` may expose the full-song URL under any of a
- * few common keys (`url`, `downloadUrl`, `audioUrl`, `previewUrl`, `stream`,
- * `link`, `src`); we accept the first one we find. `music.apiUrl` is reused, so
- * `{query}` is replaced with the song text just like the sticker command.
- */
-
 function formatDuration(ms) {
 	if (!ms || ms < 0) return "0:00";
 	const total = Math.round(ms / 1000);
@@ -31,7 +18,6 @@ function messageIDOf(result) {
 	return null;
 }
 
-/** Collect a full-song audio URL from a track object, whatever key it uses. */
 function pickAudioUrl(track) {
 	if (!track || typeof track !== "object") return null;
 	const keys = ["url", "downloadUrl", "download_url", "audioUrl", "audio_url",
@@ -47,7 +33,6 @@ function pickAudioUrl(track) {
 	return null;
 }
 
-/** Normalize whatever the API returns into a list with a title, artist and URL. */
 function normalizeTracks(data) {
 	const list = Array.isArray(data) ? data
 		: Array.isArray(data && data.tracks) ? data.tracks
@@ -69,9 +54,6 @@ function normalizeTracks(data) {
 async function searchSongs(query, message, config) {
 	const music = (config && config.music) || { };
 
-	// Prefer a configured full-song server. Blank apiUrl falls through to
-	// Instagram's own music catalogue, whose tracks carry a full-length
-	// progressive audio URL.
 	if (music.enable !== false && music.apiUrl) {
 		const url = music.apiUrl.includes("{query}")
 			? music.apiUrl.replace("{query}", encodeURIComponent(query))
@@ -87,27 +69,33 @@ async function searchSongs(query, message, config) {
 	const result = await message.musicSearch(query);
 	const tracks = normalizeTracks(result || { });
 	if (!tracks.length)
-		throw new Error("no full songs found (Instagram returned no audio URL)");
+		throw new Error("no full songs found");
 	return tracks;
 }
 
 async function sendSong(message, track) {
 	if (!track || !track.url)
-		return message.reply("That song is no longer available. Search again.");
+		return message.reply("song is no longer available");
 	try {
-		// Instagram's full-song file is an audio-only MP4: tag it with an audio
-		// MIME so it routes to sendAudio, not sendVideo. The audio broadcast is
-		// media-only (its caption would arrive AFTER the clip), so `textFirst`
-		// posts the title as its own message first.
 		await message.send({
-			body: `${track.title || "Unknown"} — ${track.artist || "Unknown"}${track.durationMs ? ` (${formatDuration(track.durationMs)})` : ""}`,
-			attachment: { url: track.url, mimetype: track.mimetype || "audio/mp4" },
-			textFirst: true
+			attachment: { url: track.url, mimetype: track.mimetype || "audio/mp4" }
 		});
 	}
 	catch (error) {
-		return message.reply(`Could not send "${track.title || "the song"}": ${String(error.message || error)}`);
+		return message.reply("could not send that song");
 	}
+}
+
+function unsend(api, messageID, threadID) {
+	if (!api || !messageID) return Promise.resolve();
+	return new Promise((resolve) => {
+		try {
+			api.unsendMessage(messageID, threadID, () => resolve());
+		}
+		catch (_) {
+			resolve();
+		}
+	});
 }
 
 module.exports = {
@@ -122,10 +110,10 @@ module.exports = {
 		usage: { en: "{p}sing <song name or artist> | {p}sing <number> to pick from the last search" }
 	},
 
-	onStart: async function ({ message, args, event, config, usersData, setReplyHandler }) {
+	onStart: async function ({ message, args, event, config, api, usersData, setReplyHandler }) {
 		const query = args.join(" ").trim();
 		if (!query)
-			return message.reply(`Usage: sing <song name>\nExample: sing blinding lights`);
+			return message.reply("usage sing <song name>");
 
 		const last = usersData.get(event.senderID) || { };
 		const cached = last.data && last.data.lastSong;
@@ -134,7 +122,7 @@ module.exports = {
 			const index = Number(query) - 1;
 			const track = cached.tracks[index];
 			if (!track)
-				return message.reply(`Pick a number between 1 and ${cached.tracks.length}.`);
+				return message.reply(`pick a number between 1 and ${cached.tracks.length}`);
 			return sendSong(message, track);
 		}
 
@@ -143,7 +131,7 @@ module.exports = {
 			tracks = await searchSongs(query, message, config);
 		}
 		catch (error) {
-			return message.reply(`Song search failed: ${String(error.message || error)}`);
+			return message.reply("song search failed");
 		}
 
 		const top = tracks.slice(0, 10);
@@ -153,20 +141,25 @@ module.exports = {
 			return sendSong(message, top[0]);
 
 		const lines = top.map((track, index) =>
-			`${index + 1}. ${track.title || "Unknown"} — ${track.artist || "Unknown"}${track.durationMs ? ` (${formatDuration(track.durationMs)})` : ""}`
+			`${index + 1} ${track.title || "Unknown"} ${track.artist || "Unknown"}${track.durationMs ? ` ${formatDuration(track.durationMs)}` : ""}`
 		);
 		const sent = await message.reply(
-			`Full songs for "${query}"\n${lines.join("\n")}\n\nReply with sing <number> to send one.`
+			`full songs for ${query}\n${lines.join("\n")}\nreply with sing <number> to send one`
 		);
+
+		const listID = messageIDOf(sent);
 
 		if (typeof setReplyHandler === "function") {
 			setReplyHandler(async ({ message: replyMessage, event: replyEvent }) => {
 				const pick = String(replyEvent.body || "").trim().split(/\s+/).pop();
 				if (!/^\d+$/.test(pick)) return;
 				const chosen = top[Number(pick) - 1];
-				if (!chosen) return replyMessage.reply(`Pick a number between 1 and ${top.length}.`);
+				if (!chosen) return replyMessage.reply(`pick a number between 1 and ${top.length}`);
+				const pickID = replyEvent.messageID;
+				await unsend(api, listID, event.threadID);
+				await unsend(api, pickID, event.threadID);
 				await sendSong(replyMessage, chosen);
-				}, messageIDOf(sent));
+			}, listID);
 		}
 		return sent;
 	}
